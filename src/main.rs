@@ -20,6 +20,7 @@
 use std::{
     fs::{create_dir_all, remove_dir_all, File},
     io::Write,
+    net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -28,6 +29,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use c2pa::{Error, Ingredient, Manifest, ManifestStore, ManifestStoreReport, Signer};
 use clap::{Parser, Subcommand};
 use log::debug;
+use rocket::routes;
 use serde::Deserialize;
 use signer::SignConfig;
 use url::Url;
@@ -181,6 +183,22 @@ enum Commands {
         /// to match [myfile_abc1.m4s, myfile_abc2180.m4s, ...] )
         #[arg(long = "fragments_glob", verbatim_doc_comment)]
         fragments_glob: Option<PathBuf>,
+    },
+    /// Sub-command to launch an HTTP server to receive and sign a MPEG-DASH live stream
+    ///
+    /// # Example
+    ///
+    /// $ c2patool -m manifest.json -o ../media . live --bind [::]6666 --target https://localhost:7777/ingest/
+    ///
+    /// Note: this will not use the input <PATH>
+    Live {
+        /// receive address to listen on
+        #[arg(short, long, default_value = "[::]:6262")]
+        bind: SocketAddr,
+
+        /// target url to proxy the signed live stream to
+        #[arg(short, long, default_value = "https://localhost:6363/ingest/")]
+        target: Url,
     },
 }
 
@@ -452,8 +470,11 @@ fn main() -> Result<()> {
         Some(Commands::Fragment { fragments_glob: _ })
     );
 
+    // check for is not live first to skip <PATH> verification, not used anyways for live
+    let is_live = matches!(args.command, Some(Commands::Live { bind: _, target: _ }));
+
     // make sure path is not a glob when not fragmented
-    if !args.path.is_file() && !is_fragment {
+    if !is_live && !args.path.is_file() && !is_fragment {
         bail!("glob patterns only allowed when using \"fragment\" command")
     }
 
@@ -586,6 +607,13 @@ fn main() -> Result<()> {
                 } else {
                     bail!("fragments_glob must be set");
                 }
+            } else if let Some(Commands::Live { bind, target }) = &args.command {
+                println!("LIVE");
+                println!("Bind: {:?}", bind);
+                println!("Target: {}", target);
+                println!("Output: {:?}", output);
+                let rocket = rocket::build().mount("/ingest", routes![]);
+                rocket::execute(rocket.launch())?;
             } else {
                 if ext_normal(&output) != ext_normal(&args.path) {
                     bail!("Output type must match source type");

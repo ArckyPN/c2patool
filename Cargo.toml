@@ -41,6 +41,9 @@ openssl = { version = "0.10.61", features = ["vendored"] }
 reqwest = { version = "0.12.4", features = ["blocking"] }
 url = "2.5.0"
 
+# Live
+rocket = { workspace = true }
+
 [dev-dependencies]
 assert_cmd = "2.0.14"
 httpmock = "0.7.0"
