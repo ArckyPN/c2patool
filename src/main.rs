@@ -20,16 +20,25 @@
 use std::{
     fs::{create_dir_all, remove_dir_all, File},
     io::Write,
+    iter::FromIterator,
     net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use c2pa::{Error, Ingredient, Manifest, ManifestStore, ManifestStoreReport, Signer};
 use clap::{Parser, Subcommand};
+use live::{clear_media, delete_ingest, post_ingest, LiveSigner};
 use log::debug;
-use rocket::routes;
+use reqwest::{blocking, Client};
+use rocket::{
+    fairing::AdHoc,
+    routes,
+    tokio::{join, sync::Mutex},
+    Config,
+};
 use serde::Deserialize;
 use signer::SignConfig;
 use url::Url;
@@ -39,9 +48,9 @@ use crate::{
     info::info,
 };
 
-mod info;
-
 mod callback_signer;
+mod info;
+mod live;
 mod signer;
 
 /// Tool for displaying and creating C2PA manifests.
@@ -196,10 +205,18 @@ enum Commands {
         #[arg(short, long, default_value = "[::]:6262")]
         bind: SocketAddr,
 
-        /// target url to proxy the signed live stream to
-        #[arg(short, long, default_value = "https://localhost:6363/ingest/")]
+        /// target url to proxy the signed live stream to (trailing slash is very important!)
+        #[arg(short, long, default_value = "https://localhost:6363/ingest/", value_parser = trailing_slash_url)]
         target: Url,
     },
+}
+
+fn trailing_slash_url(s: &str) -> Result<Url, String> {
+    if s.ends_with("/") {
+        Url::parse(s).map_err(|err| err.to_string())
+    } else {
+        Err(format!("missing trailing slash! Try with: {s}/"))
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -443,11 +460,16 @@ fn verify_fragmented(init_pattern: &Path, frag_pattern: &Path) -> Result<Vec<Man
 fn main() -> Result<()> {
     let args = CliArgs::parse();
 
+    // check for is not live first to skip <PATH> verification, not used anyways for live
+    let is_live = matches!(args.command, Some(Commands::Live { bind: _, target: _ }));
+
     // set RUST_LOG=debug to get detailed debug logging
-    if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "error");
+    if !is_live {
+        if std::env::var("RUST_LOG").is_err() {
+            std::env::set_var("RUST_LOG", "error");
+        }
+        env_logger::init();
     }
-    env_logger::init();
 
     let path = &args.path;
 
@@ -469,9 +491,6 @@ fn main() -> Result<()> {
         &args.command,
         Some(Commands::Fragment { fragments_glob: _ })
     );
-
-    // check for is not live first to skip <PATH> verification, not used anyways for live
-    let is_live = matches!(args.command, Some(Commands::Live { bind: _, target: _ }));
 
     // make sure path is not a glob when not fragmented
     if !is_live && !args.path.is_file() && !is_fragment {
@@ -575,7 +594,7 @@ fn main() -> Result<()> {
             manifest.set_sidecar_manifest();
         }
 
-        let signer = if let Some(signer_process_name) = args.signer_path {
+        let signer = if let Some(signer_process_name) = args.signer_path.clone() {
             let cb_config = CallbackSignerConfig::new(&sign_config, args.reserve_size)?;
 
             let process_runner = Box::new(ExternalProcessRunner::new(
@@ -608,11 +627,30 @@ fn main() -> Result<()> {
                     bail!("fragments_glob must be set");
                 }
             } else if let Some(Commands::Live { bind, target }) = &args.command {
-                println!("LIVE");
-                println!("Bind: {:?}", bind);
-                println!("Target: {}", target);
-                println!("Output: {:?}", output);
-                let rocket = rocket::build().mount("/ingest", routes![]);
+                let rocket_config = Config {
+                    address: bind.ip(),
+                    port: bind.port(),
+                    ..Default::default()
+                };
+                let manifest = serde_json::to_string_pretty(&manifest)?;
+                let rocket = rocket::custom(rocket_config)
+                    .mount("/ingest", routes![post_ingest, delete_ingest])
+                    .manage(LiveSigner {
+                        media: output.clone(),
+                        target: target.to_owned(),
+                        client: Client::new(),
+                        sync_client: Arc::new(blocking::Client::new()),
+                        sign_config: Arc::new(sign_config),
+                        manifest,
+                    })
+                    // TODO remove this when it is working
+                    .attach(AdHoc::on_shutdown("media cleaner", |_| {
+                        Box::pin(async move {
+                            if let Err(err) = clear_media(output) {
+                                log::error!("failed to clean up media: {}", err);
+                            }
+                        })
+                    }));
                 rocket::execute(rocket.launch())?;
             } else {
                 if ext_normal(&output) != ext_normal(&args.path) {
