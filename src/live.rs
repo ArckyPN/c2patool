@@ -192,17 +192,14 @@ impl LiveSigner {
     where
         P: AsRef<Path>,
     {
-        self.target
-            .join(name)
-            .map_err(|err| {
-                log::error!("failed to join {name} to cdn target: {err}");
-                Status::InternalServerError
-            })?
-            .join(uri.as_ref().to_str().ok_or(Status::InternalServerError)?)
-            .map_err(|err| {
-                log::error!("failed to join {:?} to cdn target: {err}", uri.as_ref());
-                Status::InternalServerError
-            })
+        let uri = uri.as_ref().as_os_str().to_str().ok_or_else(|| {
+            log::error!("invalid path");
+            Status::InternalServerError
+        })?;
+        self.target.join(&format!("{name}/{uri}")).map_err(|err| {
+            log::error!("failed to join {name} to cdn target: {err}");
+            Status::InternalServerError
+        })
     }
 
     /// sends an async post request to url with optional body
